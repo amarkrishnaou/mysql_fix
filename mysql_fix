@@ -1,3 +1,9 @@
+#!/usr/bin/env bash
+#
+# mysql_fix — Auto-heal MySQL service: check if running, OOM, disk, config, permissions.
+# Version: 1.0
+# Usage: bash <(curl -s https://github.com/amarkrishnaou/mysql_fix/blob/main/mysql_fix)
+
 #!/bin/bash
 # mysql_auto_fix.sh
 # Script to check and fix MySQL issues automatically
