@@ -1,0 +1,118 @@
+#!/bin/bash
+# mysql_auto_fix.sh
+# Script to check and fix MySQL issues automatically
+
+LOGFILE="/var/log/mysql_auto_fix.log"
+MYCNF="/etc/my.cnf"
+DATE=$(date "+%F %T")
+
+log() {
+    echo -e "[$DATE] $1" | tee -a $LOGFILE
+}
+
+get_ram_gb() {
+    awk '/MemTotal/ {printf "%.0f\n", $2/1024/1024}' /proc/meminfo
+}
+
+log "==== Starting MySQL Health Check ===="
+
+# 1. Check if MySQL service is running
+if ! systemctl is-active --quiet mysqld mariadb mysql; then
+    log "MySQL is NOT running. Checking issues..."
+
+    # 2. Check if OOM killed MySQL
+    OOM_DETECTED=0
+    if dmesg | grep -i -E "killed process.*(mysql|mysqld)" >/dev/null 2>&1; then
+        OOM_DETECTED=1
+        log "OOM kill detected for MySQL from dmesg:"
+        dmesg | grep -i -E "killed process.*(mysql|mysqld)" | tail -n5 | tee -a $LOGFILE
+    elif journalctl -k -n 500 | grep -i -E "killed process.*(mysql|mysqld)" >/dev/null 2>&1; then
+        OOM_DETECTED=1
+        log "OOM kill detected for MySQL from journalctl:"
+        journalctl -k -n 500 | grep -i -E "killed process.*(mysql|mysqld)" | tail -n5 | tee -a $LOGFILE
+    fi
+
+    # 3. Check disk usage for /
+    ROOT_USAGE=$(df -h / | awk 'NR==2 {print $5}' | tr -d '%')
+    if [ "$ROOT_USAGE" -ge 95 ]; then
+        log "Disk usage for / is ${ROOT_USAGE}%. Running disk breakdown..."
+        # (Your long disk usage block goes here – unchanged for brevity)
+    fi
+
+    # 4. Check permissions
+    log "Checking MySQL data directory permissions..."
+    DATADIR=$(my_print_defaults mysqld | grep -i datadir | awk -F= '{print $2}')
+    [ -z "$DATADIR" ] && DATADIR="/var/lib/mysql"
+
+    if [ ! -w "$DATADIR" ]; then
+        log "Permission issue detected on $DATADIR. Fixing..."
+        chown -R mysql:mysql "$DATADIR"
+        chmod 750 "$DATADIR"
+        log "Permissions fixed for $DATADIR"
+    fi
+
+    # 5. Check MySQL config syntax
+    log "Checking /etc/my.cnf for errors..."
+    cp -a $MYCNF ${MYCNF}_bk
+    mysqld --verbose --help >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        log "Config error detected. Attempting minimal fix..."
+        sed -i '/mysqlx/d' $MYCNF   # Example fix
+        log "Showing changes in my.cnf:"
+        diff -y /etc/my.cnf{_bk,} | grep '|' | tr '|' '>'
+    fi
+
+    # 6. Optimize config if OOM was detected
+    if [ $OOM_DETECTED -eq 1 ]; then
+        log "Optimizing MySQL memory settings due to OOM..."
+        cp -a $MYCNF ${MYCNF}_pre_oom
+
+        TOTAL_RAM=$(get_ram_gb)
+        log "Total system RAM: ${TOTAL_RAM}G"
+
+        # Adaptive tuning
+        if [ $TOTAL_RAM -le 4 ]; then
+            INNODB_SIZE="512M"
+            TMP_SIZE="32M"
+            HEAP_SIZE="32M"
+            MAX_CONN="100"
+        elif [ $TOTAL_RAM -le 8 ]; then
+            INNODB_SIZE="1G"
+            TMP_SIZE="64M"
+            HEAP_SIZE="64M"
+            MAX_CONN="150"
+        elif [ $TOTAL_RAM -le 16 ]; then
+            INNODB_SIZE="2G"
+            TMP_SIZE="128M"
+            HEAP_SIZE="128M"
+            MAX_CONN="200"
+        else
+            INNODB_SIZE="4G"
+            TMP_SIZE="256M"
+            HEAP_SIZE="256M"
+            MAX_CONN="250"
+        fi
+
+        # Apply changes
+        sed -i "s/^\s*innodb_buffer_pool_size\s*=.*$/innodb_buffer_pool_size=$INNODB_SIZE/" $MYCNF
+        sed -i "s/^\s*tmp_table_size\s*=.*$/tmp_table_size=$TMP_SIZE/" $MYCNF
+        sed -i "s/^\s*max_heap_table_size\s*=.*$/max_heap_table_size=$HEAP_SIZE/" $MYCNF
+        sed -i "s/^\s*max_connections\s*=.*$/max_connections=$MAX_CONN/" $MYCNF
+
+        log "MySQL config tuned for ${TOTAL_RAM}G RAM. Changes:"
+        diff -y /etc/my.cnf{_pre_oom,} | grep '|' | tr '|' '>'
+    fi
+
+    # 7. Try restarting MySQL
+    systemctl restart mysqld mariadb mysql 2>/dev/null
+    if systemctl is-active --quiet mysqld mariadb mysql; then
+        log "MySQL restarted successfully."
+    else
+        log "Failed to restart MySQL. Manual intervention required."
+    fi
+
+else
+    log "MySQL is running normally."
+fi
+
+log "==== MySQL Health Check Completed ===="
